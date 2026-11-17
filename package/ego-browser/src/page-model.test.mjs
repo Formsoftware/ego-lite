@@ -18,6 +18,7 @@ import {
   PageUnresponsiveError,
 } from "../dist/src/browser-runtime.js";
 import { PageLedgerStore } from "../dist/src/page-ledger.js";
+import { flushSink, resetSink } from "../dist/src/output-sink.js";
 import {
   captureTaskSpaceUserBoundary,
   createTaskSpaceHandle,
@@ -735,6 +736,7 @@ function createFixture(rootDir) {
         return { success: true };
       }
       if (method === "Target.detachFromTarget") return {};
+      if (method === "Page.screencastFrameAck") return {};
       throw new Error(`unexpected CDP method ${method}`);
     },
     async showAgentMousePosition(x, y) {
@@ -1702,6 +1704,268 @@ test("TaskSpace finish closes the space when a new Page follows the last close",
       preservedUnmanagedCount: 0,
     });
     assert.deepEqual(lifecycleCalls, ["close"]);
+  });
+});
+
+async function finishKeepingFirstPage(fixture, lifecycleCalls) {
+  const { task } = finishFixtureTask(fixture, lifecycleCalls);
+  const kept = await openTestPage(task, "https://example.test/kept");
+  await task.finish({ keep: [kept.label] });
+  lifecycleCalls.length = 0;
+  return kept.targetId;
+}
+
+function capturedRoundOutput() {
+  let output = "";
+  flushSink(
+    {
+      write(chunk) {
+        output += chunk;
+      },
+    },
+    false,
+  );
+  resetSink();
+  return output;
+}
+
+test("a claimed space closes when the agent closes task.pages() without adopting", async () => {
+  await withFixture(async (fixture) => {
+    resetSink();
+    const lifecycleCalls = [];
+    const keptTarget = await finishKeepingFirstPage(fixture, lifecycleCalls);
+
+    const { task: claimed } = finishFixtureTask(fixture, lifecycleCalls);
+    const pages = await claimed.pages();
+    assert.equal(pages.length, 0, "labels ended with the task");
+    for (const page of pages) await page.close();
+    assert.equal(fixture.tabs.has(keptTarget), true, "nothing was closed yet");
+
+    const receipt = await claimed.finish({ keep: [] });
+
+    assert.deepEqual(receipt, {
+      spaceId: 7,
+      closedSpace: true,
+      keptManagedLabels: [],
+      closedManagedLabels: [],
+      preservedUnmanagedCount: 0,
+    });
+    assert.deepEqual(lifecycleCalls, ["close"]);
+    assert.doesNotMatch(capturedRoundOutput(), /did not close/);
+  });
+});
+
+test("a claimed space closes when every adopted Page is closed before finish", async () => {
+  await withFixture(async (fixture) => {
+    const lifecycleCalls = [];
+    await finishKeepingFirstPage(fixture, lifecycleCalls);
+
+    const { task: claimed } = finishFixtureTask(fixture, lifecycleCalls);
+    await claimed.adopt((await claimed.tabs())[0].page);
+    for (const page of await claimed.pages()) await page.close();
+    assert.equal((await claimed.pages()).length, 0);
+
+    const receipt = await claimed.finish({ keep: [] });
+
+    assert.equal(receipt.closedSpace, true);
+    assert.deepEqual(lifecycleCalls, ["close"]);
+  });
+});
+
+test("a three-reply conversation closes the space it kept and claimed twice", async () => {
+  await withFixture(async (fixture) => {
+    const lifecycleCalls = [];
+    const keptTarget = await finishKeepingFirstPage(fixture, lifecycleCalls);
+
+    const { task: followUp } = finishFixtureTask(fixture, lifecycleCalls);
+    const page = await followUp.adopt((await followUp.tabs())[0].page);
+    assert.equal(page.targetId, keptTarget);
+    await page.goto("https://example.test/follow-up");
+    const kept = await followUp.finish({ keep: [page.label] });
+    assert.equal(kept.closedSpace, false);
+    assert.deepEqual(lifecycleCalls, ["finish"]);
+
+    lifecycleCalls.length = 0;
+    const { task: summary } = finishFixtureTask(fixture, lifecycleCalls);
+    assert.equal((await summary.pages()).length, 0);
+    const receipt = await summary.finish({ keep: [] });
+
+    assert.equal(receipt.closedSpace, true);
+    assert.deepEqual(lifecycleCalls, ["close"]);
+  });
+});
+
+test("a claimed space closes with every tab kept by keep all", async () => {
+  await withFixture(async (fixture) => {
+    const lifecycleCalls = [];
+    const { task } = finishFixtureTask(fixture, lifecycleCalls);
+    await openTestPage(task, "https://example.test/one");
+    await openTestPage(task, "https://example.test/two");
+    await task.finish({ keep: "all" });
+    lifecycleCalls.length = 0;
+
+    const { task: claimed } = finishFixtureTask(fixture, lifecycleCalls);
+    const receipt = await claimed.finish({ keep: [] });
+
+    assert.equal(receipt.closedSpace, true);
+    assert.equal(receipt.preservedUnmanagedCount, 0);
+    assert.deepEqual(lifecycleCalls, ["close"]);
+  });
+});
+
+test("a claim forgets a kept tab the user closed in the meantime", async () => {
+  await withFixture(async (fixture) => {
+    const lifecycleCalls = [];
+    const { ledger, task } = finishFixtureTask(fixture, lifecycleCalls);
+    const closedByUser = await openTestPage(task, "https://example.test/one");
+    const stillOpen = await openTestPage(task, "https://example.test/two");
+    await task.finish({ keep: "all" });
+    lifecycleCalls.length = 0;
+    fixture.tabs.delete(closedByUser.targetId);
+
+    const { task: claimed } = finishFixtureTask(fixture, lifecycleCalls);
+    assert.equal((await claimed.tabs()).length, 1);
+    assert.deepEqual((await ledger.read(7)).retainedTargets, [
+      stillOpen.targetId,
+    ]);
+
+    const receipt = await claimed.finish({ keep: [] });
+    assert.equal(receipt.closedSpace, true);
+    assert.deepEqual(lifecycleCalls, ["close"]);
+  });
+});
+
+test("a kept tab of unknown origin stays protected after a claim", async () => {
+  await withFixture(async (fixture) => {
+    resetSink();
+    const lifecycleCalls = [];
+    const { ledger, task } = finishFixtureTask(fixture, lifecycleCalls);
+    const agentPage = await openTestPage(task, "https://example.test/agent");
+    fixture.addExternalTab("target-user", "https://example.test/user");
+    await ledger.keepUnmanaged(7, "target-user", "unknown");
+    const userTab = (await task.tabs()).find(
+      (tab) => tab.targetId === "target-user",
+    );
+    const adopted = await task.adopt(userTab.page);
+    assert.equal(adopted.openedBy, "unknown");
+    await task.finish({ keep: "all" });
+    lifecycleCalls.length = 0;
+    resetSink();
+
+    const { task: claimed } = finishFixtureTask(fixture, lifecycleCalls);
+    const origins = Object.fromEntries(
+      (await claimed.tabs()).map((tab) => [tab.targetId, tab.openedBy]),
+    );
+    assert.deepEqual(origins, {
+      [agentPage.targetId]: "agent",
+      "target-user": "unknown",
+    });
+
+    const receipt = await claimed.finish({ keep: [] });
+
+    assert.equal(receipt.closedSpace, false);
+    assert.deepEqual(lifecycleCalls, ["finish"]);
+    assert.equal(fixture.tabs.has(agentPage.targetId), false);
+    assert.equal(fixture.tabs.has("target-user"), true);
+    assert.match(capturedRoundOutput(), /did not close task space 7/);
+  });
+});
+
+test("finish reports an unclosed space only when it was asked to keep nothing", async () => {
+  await withFixture(async (fixture) => {
+    resetSink();
+    const lifecycleCalls = [];
+    await finishKeepingFirstPage(fixture, lifecycleCalls);
+    fixture.addExternalTab("target-user", "https://example.test/user");
+
+    const { task: claimed } = finishFixtureTask(fixture, lifecycleCalls);
+    const receipt = await claimed.finish({ keep: "all" });
+
+    assert.equal(receipt.closedSpace, false);
+    assert.equal(receipt.preservedUnmanagedCount, 1);
+    assert.doesNotMatch(capturedRoundOutput(), /did not close/);
+  });
+});
+
+test("TaskSpace finish protects a tab opened while the user owned the space", async () => {
+  await withFixture(async (fixture) => {
+    resetSink();
+    const lifecycleCalls = [];
+    const keptTarget = await finishKeepingFirstPage(fixture, lifecycleCalls);
+    fixture.addExternalTab("target-user", "https://example.test/user");
+
+    const { task: claimed } = finishFixtureTask(fixture, lifecycleCalls);
+    const origins = Object.fromEntries(
+      (await claimed.tabs()).map((tab) => [tab.targetId, tab.openedBy]),
+    );
+    assert.deepEqual(origins, {
+      [keptTarget]: "agent",
+      "target-user": "unknown",
+    });
+    const receipt = await claimed.finish({ keep: [] });
+
+    assert.equal(receipt.closedSpace, false);
+    assert.equal(receipt.preservedUnmanagedCount, 1);
+    assert.deepEqual(lifecycleCalls, ["finish"]);
+    assert.equal(fixture.tabs.has(keptTarget), false, "the kept tab is closed");
+    assert.equal(fixture.tabs.has("target-user"), true, "the user tab remains");
+    assert.match(
+      capturedRoundOutput(),
+      /did not close task space 7: 1 tab\(s\) of user or unknown origin/,
+    );
+    resetSink();
+  });
+});
+
+test("TaskSpace finish leaves earlier kept tabs open unless it keeps nothing", async () => {
+  await withFixture(async (fixture) => {
+    const lifecycleCalls = [];
+    const keptTarget = await finishKeepingFirstPage(fixture, lifecycleCalls);
+
+    const { task: second } = finishFixtureTask(fixture, lifecycleCalls);
+    const secondPage = await openTestPage(second, "https://example.test/two");
+    const receipt = await second.finish({ keep: [secondPage.label] });
+    assert.equal(receipt.closedSpace, false);
+    assert.equal(
+      fixture.tabs.has(keptTarget),
+      true,
+      "named keep does not close it",
+    );
+
+    const { task: third } = finishFixtureTask(fixture, lifecycleCalls);
+    const keepAll = await third.finish({ keep: "all" });
+    assert.equal(keepAll.closedSpace, false);
+    assert.equal(
+      fixture.tabs.has(keptTarget),
+      true,
+      "keep all does not close it",
+    );
+
+    lifecycleCalls.length = 0;
+    const { task: last } = finishFixtureTask(fixture, lifecycleCalls);
+    const closing = await last.finish({ keep: [] });
+    assert.equal(closing.closedSpace, true, "origin survives repeated rounds");
+    assert.deepEqual(lifecycleCalls, ["close"]);
+  });
+});
+
+test("a claimed space closes when its kept tab is adopted but not closed before finish", async () => {
+  await withFixture(async (fixture) => {
+    resetSink();
+    const lifecycleCalls = [];
+    const keptTarget = await finishKeepingFirstPage(fixture, lifecycleCalls);
+
+    const { task: claimed } = finishFixtureTask(fixture, lifecycleCalls);
+    const [tab] = await claimed.tabs();
+    assert.equal(tab.targetId, keptTarget);
+    const adopted = await claimed.adopt(tab.page);
+    assert.equal(adopted.openedBy, "agent");
+
+    const receipt = await claimed.finish({ keep: [] });
+    assert.equal(receipt.closedSpace, true);
+    assert.deepEqual(receipt.closedManagedLabels, [adopted.label]);
+    assert.deepEqual(lifecycleCalls, ["close"]);
+    assert.doesNotMatch(capturedRoundOutput(), /did not close/);
   });
 });
 
@@ -4135,6 +4399,59 @@ test("Page fill retries an appended value and accepts the transformed retry", as
   });
 });
 
+test("Page fill retries a contenteditable that prepended instead of replacing", async () => {
+  await withFixture(async (fixture) => {
+    const task = taskForRound(fixture, "round-a");
+    const page = await openTestPage(task, "https://example.test/editor");
+    // A code editor that ignores the DOM Range selection until a real
+    // pointer activation inserts at offset 0 on the first attempt.
+    fixture.configureFill({
+      kind: "contenteditable",
+      initialText: "const old = 1;",
+      transform: (text, current, attempt) =>
+        attempt === 1 ? text + current : text,
+    });
+    fixture.calls.length = 0;
+
+    assert.deepEqual(
+      await page.fill("[contenteditable]", "const next = 2;"),
+      {},
+    );
+    assert.equal(fixture.fillText(), "const next = 2;");
+    const cdpMethods = fixture.calls
+      .filter(([kind]) => kind === "cdp")
+      .map(([, method]) => method);
+    assert.equal(
+      cdpMethods.filter((method) => method === "Input.insertText").length,
+      2,
+    );
+    assert.ok(
+      cdpMethods.includes("Input.dispatchMouseEvent"),
+      "a prepended fill must retry after a real pointer activation",
+    );
+  });
+});
+
+test("Page fill rejects a contenteditable that keeps inserting into the old text", async () => {
+  await withFixture(async (fixture) => {
+    const task = taskForRound(fixture, "round-a");
+    const page = await openTestPage(task, "https://example.test/editor");
+    fixture.configureFill({
+      kind: "contenteditable",
+      initialText: "old text",
+      transform: (text, current, attempt) =>
+        attempt === 1
+          ? text + current
+          : current.slice(0, 3) + text + current.slice(3),
+    });
+
+    await assert.rejects(
+      () => page.fill("[contenteditable]", "new"),
+      /did not accept the text.*click the editor and use page\.keyboard/i,
+    );
+  });
+});
+
 test("Page fill accepts a controlled component transformation", async () => {
   await withFixture(async (fixture) => {
     const task = taskForRound(fixture, "round-a");
@@ -5384,6 +5701,18 @@ test("Page and TaskSpace CDP reject a sessionId they would not honour", async ()
           sessionId === undefined,
       ),
       "Target commands that define params.sessionId must still pass through",
+    );
+
+    await page.cdp("Page.screencastFrameAck", { sessionId: 7 });
+    assert(
+      fixture.calls.some(
+        ([kind, method, params, sessionId]) =>
+          kind === "cdp" &&
+          method === "Page.screencastFrameAck" &&
+          params.sessionId === 7 &&
+          sessionId === "session:target-1",
+      ),
+      "a screencast ack must reach the Page session with its frame number",
     );
   });
 });
