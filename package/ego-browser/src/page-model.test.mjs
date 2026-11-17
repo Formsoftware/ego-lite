@@ -734,6 +734,7 @@ function createFixture(rootDir) {
         return { success: true };
       }
       if (method === "Target.detachFromTarget") return {};
+      if (method === "Page.screencastFrameAck") return {};
       throw new Error(`unexpected CDP method ${method}`);
     },
     async showAgentMousePosition(x, y) {
@@ -4454,6 +4455,59 @@ test("Page fill retries an appended value and accepts the transformed retry", as
   });
 });
 
+test("Page fill retries a contenteditable that prepended instead of replacing", async () => {
+  await withFixture(async (fixture) => {
+    const task = taskForRound(fixture, "round-a");
+    const page = await openTestPage(task, "https://example.test/editor");
+    // A code editor that ignores the DOM Range selection until a real
+    // pointer activation inserts at offset 0 on the first attempt.
+    fixture.configureFill({
+      kind: "contenteditable",
+      initialText: "const old = 1;",
+      transform: (text, current, attempt) =>
+        attempt === 1 ? text + current : text,
+    });
+    fixture.calls.length = 0;
+
+    assert.deepEqual(
+      await page.fill("[contenteditable]", "const next = 2;"),
+      {},
+    );
+    assert.equal(fixture.fillText(), "const next = 2;");
+    const cdpMethods = fixture.calls
+      .filter(([kind]) => kind === "cdp")
+      .map(([, method]) => method);
+    assert.equal(
+      cdpMethods.filter((method) => method === "Input.insertText").length,
+      2,
+    );
+    assert.ok(
+      cdpMethods.includes("Input.dispatchMouseEvent"),
+      "a prepended fill must retry after a real pointer activation",
+    );
+  });
+});
+
+test("Page fill rejects a contenteditable that keeps inserting into the old text", async () => {
+  await withFixture(async (fixture) => {
+    const task = taskForRound(fixture, "round-a");
+    const page = await openTestPage(task, "https://example.test/editor");
+    fixture.configureFill({
+      kind: "contenteditable",
+      initialText: "old text",
+      transform: (text, current, attempt) =>
+        attempt === 1
+          ? text + current
+          : current.slice(0, 3) + text + current.slice(3),
+    });
+
+    await assert.rejects(
+      () => page.fill("[contenteditable]", "new"),
+      /did not accept the text.*click the editor and use page\.keyboard/i,
+    );
+  });
+});
+
 test("Page fill accepts a controlled component transformation", async () => {
   await withFixture(async (fixture) => {
     const task = taskForRound(fixture, "round-a");
@@ -5703,6 +5757,18 @@ test("Page and TaskSpace CDP reject a sessionId they would not honour", async ()
           sessionId === undefined,
       ),
       "Target commands that define params.sessionId must still pass through",
+    );
+
+    await page.cdp("Page.screencastFrameAck", { sessionId: 7 });
+    assert(
+      fixture.calls.some(
+        ([kind, method, params, sessionId]) =>
+          kind === "cdp" &&
+          method === "Page.screencastFrameAck" &&
+          params.sessionId === 7 &&
+          sessionId === "session:target-1",
+      ),
+      "a screencast ack must reach the Page session with its frame number",
     );
   });
 });
