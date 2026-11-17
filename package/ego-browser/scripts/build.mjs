@@ -47,7 +47,7 @@ try {
   lock = await open(buildLock, "wx");
 } catch (error) {
   if (error?.code === "EEXIST") {
-    throw new Error("another ego-browser-v2 build is already running");
+    throw new Error("another @ls/ego-browser build is already running");
   }
   throw error;
 }

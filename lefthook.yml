@@ -23,7 +23,7 @@ pre-commit:
         exit 1
     style-check:
       run: |
-        files=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '^(package/ego-browser|plugins)/.*\.(ts|mjs|js|json|md)$' | grep -v '^skills/ego-browser/learnings/' || true)
+        files=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '^(package/ego-browser|plugins)/.*\.(ts|mjs|js|json|md)$' | grep -v '^skills/ego-browser/learnings/' | grep -v '^package/ego-browser/dist/' || true)
         [ -z "$files" ] && exit 0
         package/ego-browser/node_modules/.bin/prettier --check $files
     vulnerability-audit:

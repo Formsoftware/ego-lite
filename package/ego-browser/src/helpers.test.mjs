@@ -1467,3 +1467,99 @@ test("waitForAgentControl propagates non-user-control snapshot errors", async ()
     },
   );
 });
+
+// The host ledger port singleton (helpers.setLedgerPort) must reach every
+// TaskSpace handle the helper layer creates, so embedders can keep page state
+// in memory instead of the default fs-backed store.
+function hostLedgerPortFake(calls) {
+  const emptyLedger = (spaceId) => ({
+    spaceId,
+    nextLabel: 1,
+    usedLabels: [],
+    releasedLabels: [],
+    initialized: false,
+    userControlPending: false,
+    unmanagedTargets: {},
+    pages: {},
+  });
+  return {
+    async read(spaceId) {
+      calls.push(["read", spaceId]);
+      return emptyLedger(spaceId);
+    },
+    async reconcile(spaceId) {
+      calls.push(["reconcile", spaceId]);
+      return emptyLedger(spaceId);
+    },
+  };
+}
+
+function resolvedResearchSpaceEgo() {
+  return {
+    // sendCDPMessage marks this fake as a browser runtime so background page
+    // discovery runs (isBrowserRuntime gates it); throwing synchronously makes
+    // Target.setDiscoverTargets fail fast instead of waiting on a CDP timeout.
+    sendCDPMessage() {
+      throw new Error("no cdp transport in test");
+    },
+    async listTaskSpaces() {
+      return {
+        taskSpaces: [
+          {
+            taskId: "research",
+            id: 7,
+            name: "Research",
+            ownership: "agent",
+          },
+        ],
+      };
+    },
+    async useTaskSpace() {},
+  };
+}
+
+test("taskSpace routes the Page ledger through a host-injected port", async () => {
+  const calls = [];
+  const restore = helperExports.setLedgerPort(hostLedgerPortFake(calls));
+  try {
+    await withEgo(resolvedResearchSpaceEgo(), async () => {
+      const task = await taskSpace("research");
+      assert.equal(task.spaceId, 7);
+    });
+  } finally {
+    restore();
+  }
+  assert.ok(
+    calls.some(([method, spaceId]) => method === "read" && spaceId === 7),
+    `expected the injected port to be read for space 7, got ${JSON.stringify(calls)}`,
+  );
+});
+
+test("setLedgerPort restore falls back to the default ledger", async () => {
+  const calls = [];
+  const restore = helperExports.setLedgerPort(hostLedgerPortFake(calls));
+  restore();
+  await withEgo(resolvedResearchSpaceEgo(), async () => {
+    const task = await taskSpace("research");
+    assert.equal(task.spaceId, 7);
+  });
+  assert.deepEqual(calls, []);
+});
+
+test("setLedgerPort restore returns to the previous port", async () => {
+  const calls = [];
+  const first = hostLedgerPortFake(calls);
+  const restoreFirst = helperExports.setLedgerPort(first);
+  const restoreNull = helperExports.setLedgerPort(null);
+  restoreNull();
+  // Restoring null rewinds to the first port, not to the default store.
+  await withEgo(resolvedResearchSpaceEgo(), async () => {
+    const task = await taskSpace("research");
+    assert.equal(task.spaceId, 7);
+  });
+  restoreFirst();
+  assert.ok(
+    calls.some(([method, spaceId]) => method === "read" && spaceId === 7),
+    `expected the restored port to stay wired, got ${JSON.stringify(calls)}`,
+  );
+});

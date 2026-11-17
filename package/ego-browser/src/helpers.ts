@@ -333,8 +333,18 @@ export async function taskSpace(
   );
 }
 
+// Overrides for createTaskSpaceHandle derived from the host-set ledger port
+// singleton. An absent port yields no override so the default fs-backed store
+// stays in place (a { ledger: undefined } override would clobber the default).
+function hostLedgerOverrides() {
+  return state.ledgerPort ? { ledger: state.ledgerPort } : {};
+}
+
 async function initializeResolvedTaskSpace(resolution) {
-  const task = createTaskSpaceHandle(resolution.descriptor);
+  const task = createTaskSpaceHandle(
+    resolution.descriptor,
+    hostLedgerOverrides(),
+  );
   if (!resolution.created) {
     await initializeTaskSpaceHandle(task);
     return task;
@@ -361,7 +371,10 @@ async function initializeResolvedTaskSpace(resolution) {
 export async function claimTaskSpace(nameOrId) {
   const space = await findTaskSpace(nameOrId, "claimTaskSpace");
   const claimed = await claimResolvedTaskSpace(space, "claimTaskSpace");
-  const task = createTaskSpaceHandle({ ...claimed, ownership: "agent" });
+  const task = createTaskSpaceHandle(
+    { ...claimed, ownership: "agent" },
+    hostLedgerOverrides(),
+  );
   await captureTaskSpaceUserBoundary(task);
   await initializeTaskSpaceHandle(task);
   return task;
@@ -501,7 +514,10 @@ export async function takeOverTaskSpace(nameOrId?: string | number) {
   }
   await invokeEgo("takeOverTaskSpace", () => ego.takeOverTaskSpace());
   if (descriptor) {
-    const task = createTaskSpaceHandle({ ...descriptor, ownership: "agent" });
+    const task = createTaskSpaceHandle(
+      { ...descriptor, ownership: "agent" },
+      hostLedgerOverrides(),
+    );
     // Repeatedly ensuring control over an already agent-controlled space is a
     // no-op, not a user interaction boundary. Only delegated spaces can have
     // gained tabs through user activity since the Agent last controlled them.
@@ -767,6 +783,23 @@ export async function loadAgentHelpers() {
     }
   }
   return out;
+}
+
+/**
+ * Register a host-provided Page-ledger port (LedgerPort in page-model.ts) that
+ * every TaskSpace handle created by the helper layer uses for page state,
+ * instead of the default fs-backed store. Intended for embedders that keep the
+ * ledger in memory. Pass null to fall back to the default. Returns a restore
+ * function, mirroring __testing.setOverrides.
+ * @param {import('./page-model.js').LedgerPort | null} port Host ledger port.
+ * @returns {() => void} Call to restore the previous port.
+ */
+export function setLedgerPort(port) {
+  const previous = state.ledgerPort;
+  state.ledgerPort = port;
+  return () => {
+    state.ledgerPort = previous;
+  };
 }
 
 export const __testing = { setOverrides, decodeUnserializableJsValue };

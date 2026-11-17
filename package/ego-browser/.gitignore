@@ -1,5 +1,11 @@
 node_modules/
 dist/
+# The built bundle is committed for eos git-dependency consumers (tags like
+# v2.2.0-eos.1 import @ls/ego-browser/dist/out/index.js directly). These two
+# negations must live here — a deeper .gitignore wins over the blanket dist/
+# and out/ rules in the root .gitignore.
+!dist/
+!dist/**
 ego-browser.js
 bin/
 .build.lock

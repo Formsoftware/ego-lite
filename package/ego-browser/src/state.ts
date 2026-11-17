@@ -16,6 +16,9 @@ export const state = {
   preferredTargetId: null,
   // Last observed Network domain state on the default session (tracked in cdp()).
   networkDomainEnabled: false,
+  // Host-provided v2 Page-ledger port (see helpers.setLedgerPort). When null,
+  // TaskSpace handles fall back to the default fs-backed PageLedgerStore.
+  ledgerPort: null,
 };
 
 export function setOverrides(overrides) {

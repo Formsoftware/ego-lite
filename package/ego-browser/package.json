@@ -1,5 +1,5 @@
 {
-  "name": "ego-browser-v2",
+  "name": "@ls/ego-browser",
   "version": "0.1.0",
   "description": "A TypeScript single-file build of the ego-browser CDP harness.",
   "type": "module",
